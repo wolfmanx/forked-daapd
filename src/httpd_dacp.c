@@ -77,7 +77,7 @@ struct dacp_update_request {
 };
 
 typedef void (*dacp_propget)(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
-typedef void (*dacp_propset)(const char *value, struct evkeyvalq *query);
+typedef void (*dacp_propset)(struct evhttp_request *req, const char *value, struct evkeyvalq *query);
 
 struct dacp_prop_map {
   char *desc;
@@ -125,15 +125,17 @@ dacp_propget_extendedmediakind(struct evbuffer *evbuf, struct player_status *sta
 
 /* Forward - properties setters */
 static void
-dacp_propset_volume(const char *value, struct evkeyvalq *query);
+dacp_propset_volume(struct evhttp_request *req, const char *value, struct evkeyvalq *query);
 static void
-dacp_propset_playingtime(const char *value, struct evkeyvalq *query);
+dacp_propset_devicevolume(struct evhttp_request *req, const char *value, struct evkeyvalq *query);
 static void
-dacp_propset_shufflestate(const char *value, struct evkeyvalq *query);
+dacp_propset_playingtime(struct evhttp_request *req, const char *value, struct evkeyvalq *query);
 static void
-dacp_propset_repeatstate(const char *value, struct evkeyvalq *query);
+dacp_propset_shufflestate(struct evhttp_request *req, const char *value, struct evkeyvalq *query);
 static void
-dacp_propset_userrating(const char *value, struct evkeyvalq *query);
+dacp_propset_repeatstate(struct evhttp_request *req, const char *value, struct evkeyvalq *query);
+static void
+dacp_propset_userrating(struct evhttp_request *req, const char *value, struct evkeyvalq *query);
 
 
 /* gperf static hash, dacp_prop.gperf */
@@ -540,7 +542,7 @@ dacp_propget_extendedmediakind(struct evbuffer *evbuf, struct player_status *sta
 
 /* Properties setters */
 static void
-dacp_propset_volume(const char *value, struct evkeyvalq *query)
+dacp_propset_volume(struct evhttp_request *req, const char *value, struct evkeyvalq *query)
 {
   const char *param;
   uint64_t id;
@@ -589,6 +591,57 @@ dacp_propset_volume(const char *value, struct evkeyvalq *query)
 }
 
 static void
+dacp_propset_devicevolume(struct evhttp_request *req, const char *value, struct evkeyvalq *query)
+{
+  struct evkeyvalq *headers;
+  const char *param;
+  uint64_t id;
+  int volume;
+  int ret;
+
+  ret = safe_atoi32(value, &volume);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "dmcp.device-volume argument doesn't convert to integer: %s\n", value);
+
+      return;
+    }
+  else if (volume > 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Not prepared for volume of (%s, %d), please submit bug report\n", value, volume);
+
+      return;
+    }
+
+  if (volume < -30)
+    volume = 0;
+  else
+    volume = 100 + (volume * 10) / 3;
+
+  headers = evhttp_request_get_input_headers(req);
+  if (!headers)
+    {
+      DPRINTF(E_LOG, L_DACP, "Input headers required for setting dmcp.device-volume not found\n");
+
+      return;
+    }
+
+  param = evhttp_find_header(headers, "Active-Remote");
+  if (param)
+    {
+      ret = safe_atou64(param, &id);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Invalid Active-Remote speaker ID in dmcp.device-volume request\n");
+
+	  return;
+	}
+
+      player_volume_setabs_speaker(id, volume);
+    }
+}
+
+static void
 seek_timer_cb(int fd, short what, void *arg)
 {
   int ret;
@@ -609,7 +662,7 @@ seek_timer_cb(int fd, short what, void *arg)
 }
 
 static void
-dacp_propset_playingtime(const char *value, struct evkeyvalq *query)
+dacp_propset_playingtime(struct evhttp_request *req, const char *value, struct evkeyvalq *query)
 {
   struct timeval tv;
   int ret;
@@ -628,7 +681,7 @@ dacp_propset_playingtime(const char *value, struct evkeyvalq *query)
 }
 
 static void
-dacp_propset_shufflestate(const char *value, struct evkeyvalq *query)
+dacp_propset_shufflestate(struct evhttp_request *req, const char *value, struct evkeyvalq *query)
 {
   int enable;
   int ret;
@@ -645,7 +698,7 @@ dacp_propset_shufflestate(const char *value, struct evkeyvalq *query)
 }
 
 static void
-dacp_propset_repeatstate(const char *value, struct evkeyvalq *query)
+dacp_propset_repeatstate(struct evhttp_request *req, const char *value, struct evkeyvalq *query)
 {
   int mode;
   int ret;
@@ -662,7 +715,7 @@ dacp_propset_repeatstate(const char *value, struct evkeyvalq *query)
 }
 
 static void
-dacp_propset_userrating(const char *value, struct evkeyvalq *query)
+dacp_propset_userrating(struct evhttp_request *req, const char *value, struct evkeyvalq *query)
 {
   struct media_file_info *mfi;
   const char *param;
@@ -1027,7 +1080,7 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 
   param = evhttp_find_header(query, "dacp.shufflestate");
   if (param)
-    dacp_propset_shufflestate(param, NULL);
+    dacp_propset_shufflestate(req, param, NULL);
 
   id = 0;
   item_id = 0;
@@ -1257,7 +1310,7 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
   player_queue_plid(plid);
 
   if (shuffle)
-    dacp_propset_shufflestate(shuffle, NULL);
+    dacp_propset_shufflestate(req, shuffle, NULL);
 
   ret = player_playback_start_bypos(pos, NULL);
   if (ret < 0)
@@ -2255,10 +2308,11 @@ dacp_reply_setproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
     return;
 
   /* Known properties:
-   * dacp.shufflestate 0/1
-   * dacp.repeatstate  0/1/2
-   * dacp.playingtime  seek to time in ms
-   * dmcp.volume       0-100, float
+   * dacp.shufflestate  0/1
+   * dacp.repeatstate   0/1/2
+   * dacp.playingtime   seek to time in ms
+   * dmcp.volume        0-100, float
+   * dmcp.device-volume -30-0, float
    */
 
   /* /ctrl-int/1/setproperty?dacp.shufflestate=1&session-id=100 */
@@ -2274,7 +2328,7 @@ dacp_reply_setproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
 	}
 
       if (dpm->propset)
-	dpm->propset(param->value, query);
+	dpm->propset(req, param->value, query);
       else
 	DPRINTF(E_WARN, L_DACP, "No setter method for DACP property %s\n", dpm->desc);
     }
